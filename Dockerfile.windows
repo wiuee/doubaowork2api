@@ -1,0 +1,52 @@
+# escape=`
+
+# Windows images must be built on a Windows runner of the same architecture.
+# Pass TARGETARCH=amd64 with WINDOWS_BASE=mcr.microsoft.com/windows/servercore:ltsc2022
+# or TARGETARCH=arm64 with WINDOWS_BASE=mcr.microsoft.com/windows/servercore:ltsc2025-arm64.
+ARG WINDOWS_BASE=mcr.microsoft.com/windows/servercore:ltsc2022
+FROM ${WINDOWS_BASE}
+
+ARG TARGETARCH=amd64
+ARG PYTHON_VERSION=3.13.15
+
+# Keep the base image PATH unchanged so Windows HCS can still find PowerShell.
+# All Python entry points below therefore use absolute paths.
+ENV PYTHONDONTWRITEBYTECODE=1 `
+    PYTHONUNBUFFERED=1 `
+    DOUBAO_WORK_HOST=0.0.0.0 `
+    DOUBAO_WORK_PORT=18789
+
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+# The official Python Docker images do not publish Windows ARM64 variants.
+# Install the matching official Python runtime directly for both architectures.
+RUN $download = Join-Path $env:TEMP "python-installer.exe"; `
+    Invoke-WebRequest -Uri "https://www.python.org/ftp/python/${env:PYTHON_VERSION}/python-${env:PYTHON_VERSION}-${env:TARGETARCH}.exe" -OutFile $download; `
+    $process = Start-Process -FilePath $download -Wait -PassThru -ArgumentList @( `
+        '/quiet', 'InstallAllUsers=1', 'TargetDir=C:\Python', 'Include_pip=1', `
+        'Include_test=0', 'Include_doc=0', 'Include_launcher=0', `
+        'InstallLauncherAllUsers=0', 'PrependPath=0', 'Shortcuts=0' `
+    ); `
+    if ($process.ExitCode -ne 0) { throw ('Python installer failed with exit code ' + $process.ExitCode) }; `
+    Remove-Item $download -Force; `
+    & C:\Python\python.exe --version
+
+WORKDIR C:\app
+COPY pyproject.toml README.md CHANGELOG.md THIRD_PARTY_NOTICES.md ./
+COPY licenses ./licenses
+COPY doubao_work2api ./doubao_work2api
+
+# curl_cffi 0.17.0 supplies native wheels for Windows AMD64 and ARM64.
+RUN & C:\Python\python.exe -m pip install --no-cache-dir . curl-cffi==0.17.0; `
+    if ($LASTEXITCODE -ne 0) { throw ('pip install failed with exit code ' + $LASTEXITCODE) }; `
+    & C:\Python\python.exe -c 'import platform, curl_cffi; print(curl_cffi.__version__, platform.machine())'; `
+    if ($LASTEXITCODE -ne 0) { throw 'Python dependency smoke test failed' }
+
+RUN New-Item -ItemType Directory -Force -Path C:\app\accounts, C:\app\data | Out-Null
+VOLUME ["C:\\app\\accounts", "C:\\app\\data"]
+EXPOSE 18789
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 `
+  CMD Invoke-WebRequest -UseBasicParsing -Uri ('http://127.0.0.1:' + $env:DOUBAO_WORK_PORT + '/health') -TimeoutSec 3 | Out-Null
+
+CMD ["C:\\Python\\python.exe", "-m", "doubao_work2api"]

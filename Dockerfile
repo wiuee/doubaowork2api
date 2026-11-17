@@ -10,7 +10,8 @@ COPY pyproject.toml README.md CHANGELOG.md ./
 COPY THIRD_PARTY_NOTICES.md ./
 COPY licenses ./licenses
 COPY doubao_work2api ./doubao_work2api
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . "curl-cffi==0.17.0" \
+    && python -c "import curl_cffi; print('curl_cffi', curl_cffi.__version__)"
 
 RUN useradd --create-home --uid 10001 app \
     && mkdir -p /app/accounts /app/data \

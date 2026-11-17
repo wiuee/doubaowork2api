@@ -58,6 +58,17 @@ python -m doubao_work2api
 
 ### Docker
 
+预构建镜像已内置 `curl_cffi 0.17.0`，统一标签支持 `linux/amd64`、`linux/arm64`、`windows/amd64` 和 `windows/arm64`：
+
+```bash
+docker pull ghcr.io/wiuee/doubaowork2api:v1.0.0
+```
+
+也可使用平台标签 `v1.0.0-linux`、`v1.0.0-windows-amd64` 和 `v1.0.0-windows-arm64`。
+Windows 容器需要与镜像架构及基础系统兼容的 Windows 宿主机；Linux 与 Windows 镜像不能跨系统运行。
+
+从源码构建并启动：
+
 ```bash
 cp .env.example .env
 # 编辑 .env，设置自己的管理员密码与 API Key。
@@ -65,6 +76,7 @@ docker compose up -d --build
 ```
 
 Compose 默认只映射宿主机回环端口。服务器部署、目录权限、备份和迁移见 [部署文档](docs/DEPLOYMENT.md)。
+推送版本标签会触发 [Docker 发布工作流](.github/workflows/docker-publish.yml)，默认发布到 GHCR；配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN` 后也会发布到 Docker Hub。
 
 ## 调用示例
 

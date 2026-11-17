@@ -1,0 +1,320 @@
+name: Publish Docker image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build (for example v1.0.0)"
+        required: true
+        default: "v1.0.0"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-publish-${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+  CURL_CFFI_VERSION: "0.17.0"
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+jobs:
+  version:
+    name: Validate source version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Require tag == package version
+        run: |
+          set -euo pipefail
+          python3 - "$TAG" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          tag = sys.argv[1]
+          source = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          package_version = source["project"]["version"]
+          if tag != f"v{package_version}":
+              raise SystemExit(f"tag {tag} != package version v{package_version}")
+          print(f"version assert OK: {tag}")
+          PY
+
+  linux:
+    name: Linux amd64/arm64
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Determine image repositories
+        id: images
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "ghcr.io/${GITHUB_REPOSITORY,,}"
+            if [[ -n "$DOCKERHUB_USER" && -n "$DOCKERHUB_TOKEN" ]]; then
+              echo "${GITHUB_REPOSITORY,,}"
+            fi
+          } > repositories.txt
+          echo "list<<EOF" >> "$GITHUB_OUTPUT"
+          cat repositories.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != '' && env.DOCKERHUB_TOKEN != ''
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Extract platform tag metadata
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.images.outputs.list }}
+          tags: type=raw,value=${{ env.TAG }}-linux
+      - name: Build and push Linux images with curl_cffi
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=linux
+          cache-to: type=gha,scope=linux,mode=max
+      - name: Verify curl_cffi in both Linux architectures
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-linux"
+          for ARCH in amd64 arm64; do
+            docker run --rm --platform "linux/$ARCH" --entrypoint python "$IMAGE" \
+              -c "import platform, curl_cffi; assert curl_cffi.__version__ == '$CURL_CFFI_VERSION'; print(platform.machine(), curl_cffi.__version__)"
+          done
+      - name: Smoke test the Linux gateway and dashboard
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-linux"
+          cleanup() { docker rm -f doubaowork-smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name doubaowork-smoke -p 18790:18789 \
+            -e DOUBAO_WORK_ADMIN_PASSWORD=smoke-admin-password \
+            -e DOUBAO_WORK_API_KEY=sk-smoke-test "$IMAGE"
+          ready=false
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18790/health > health.json; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs doubaowork-smoke
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:18790/health
+          curl -fsS http://127.0.0.1:18790/ --output "$RUNNER_TEMP/dashboard.html"
+          grep -q '<html' "$RUNNER_TEMP/dashboard.html"
+          docker logs doubaowork-smoke
+          if docker logs doubaowork-smoke 2>&1 | grep -Eiq 'traceback|unhandled exception'; then
+            echo "::error::gateway startup logged an exception"
+            exit 1
+          fi
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2022
+            base: mcr.microsoft.com/windows/servercore:ltsc2022
+          - arch: arm64
+            runner: windows-11-arm
+            base: mcr.microsoft.com/windows/servercore:ltsc2025-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Set up Docker for Windows ARM64
+        if: matrix.arch == 'arm64'
+        uses: ndabas/setup-moby-windows-arm64@e9755ab43b45a2a3ed50acb8b8ac57af753588db
+        with:
+          version: docker-v29.9.3
+          skip-if-present: "false"
+      - name: Check Docker engine
+        shell: pwsh
+        run: |
+          docker version
+          if ($LASTEXITCODE -ne 0) { throw "Docker engine is not ready" }
+      - name: Log in to GHCR
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $env:GH_TOKEN | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          if ($LASTEXITCODE -ne 0) { throw "GHCR login failed" }
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != '' && env.DOCKERHUB_TOKEN != ''
+        shell: pwsh
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          $env:DOCKERHUB_TOKEN | docker login --username $env:DOCKERHUB_USER --password-stdin
+          if ($LASTEXITCODE -ne 0) { throw "Docker Hub login failed" }
+      - name: Build Windows image with curl_cffi
+        shell: pwsh
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+          WINDOWS_BASE: ${{ matrix.base }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repository = "ghcr.io/$($env:GITHUB_REPOSITORY.ToLower())"
+          $tags = @("${repository}:$env:TAG-windows-$env:MATRIX_ARCH")
+          if ($env:DOCKERHUB_USER -and $env:DOCKERHUB_TOKEN) {
+            $tags += "$($env:GITHUB_REPOSITORY.ToLower()):$env:TAG-windows-$env:MATRIX_ARCH"
+          }
+          $arguments = @(
+            'build', '--file', 'Dockerfile.windows',
+            '--build-arg', "TARGETARCH=$env:MATRIX_ARCH",
+            '--build-arg', "WINDOWS_BASE=$env:WINDOWS_BASE"
+          )
+          foreach ($tag in $tags) { $arguments += @('--tag', $tag) }
+          $arguments += '.'
+          & docker @arguments
+          if ($LASTEXITCODE -ne 0) { throw "docker build failed with exit code $LASTEXITCODE" }
+          $actual = & docker image inspect $tags[0] --format '{{.Os}}/{{.Architecture}}'
+          if ($actual -ne "windows/$env:MATRIX_ARCH") {
+            throw "Expected windows/$env:MATRIX_ARCH, got $actual"
+          }
+          "IMAGE=$($tags[0])" >> $env:GITHUB_ENV
+          "IMAGES=$($tags -join ' ')" >> $env:GITHUB_ENV
+      - name: Verify native architecture and curl_cffi
+        shell: pwsh
+        env:
+          EXPECTED_MACHINE: ${{ matrix.arch == 'amd64' && 'AMD64' || 'ARM64' }}
+        run: |
+          docker run --rm $env:IMAGE C:\Python\python.exe -c "import platform, curl_cffi; assert curl_cffi.__version__ == '$env:CURL_CFFI_VERSION'; assert platform.machine().upper() == '$env:EXPECTED_MACHINE'; print(platform.machine(), curl_cffi.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Windows curl_cffi smoke test failed" }
+      - name: Smoke test the Windows gateway and dashboard
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            docker run -d --name doubaowork-smoke -p 18790:18789 -e DOUBAO_WORK_ADMIN_PASSWORD=smoke-admin-password -e DOUBAO_WORK_API_KEY=sk-smoke-test $env:IMAGE
+            if ($LASTEXITCODE -ne 0) { throw "docker run failed" }
+            $healthy = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try {
+                $health = Invoke-WebRequest 'http://127.0.0.1:18790/health' -UseBasicParsing -TimeoutSec 3
+                if ($health.StatusCode -eq 200) { $healthy = $true; break }
+              } catch {
+                Start-Sleep -Seconds 2
+              }
+            }
+            if (-not $healthy) {
+              docker logs doubaowork-smoke
+              throw "gateway /health did not become ready"
+            }
+            $dashboard = Invoke-WebRequest 'http://127.0.0.1:18790/' -UseBasicParsing -TimeoutSec 10
+            if ($dashboard.Content -notmatch '<html') { throw "dashboard did not return HTML" }
+            $logs = & cmd.exe /c "docker logs doubaowork-smoke 2>&1" | Out-String
+            Write-Host $logs
+            if ($logs -match '(?i)traceback|unhandled exception') { throw "gateway logged an exception" }
+          } finally {
+            docker rm -f doubaowork-smoke | Out-Null
+          }
+      - name: Push verified Windows image
+        shell: pwsh
+        run: |
+          foreach ($image in $env:IMAGES -split ' ') {
+            docker push $image
+            if ($LASTEXITCODE -ne 0) { throw "docker push failed for $image" }
+          }
+
+  manifest:
+    name: Merge four-platform manifest
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - name: Determine image repositories
+        id: images
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "ghcr.io/${GITHUB_REPOSITORY,,}"
+            if [[ -n "$DOCKERHUB_USER" && -n "$DOCKERHUB_TOKEN" ]]; then
+              echo "${GITHUB_REPOSITORY,,}"
+            fi
+          } > repositories.txt
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != '' && env.DOCKERHUB_TOKEN != ''
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish and verify multi-platform manifest
+        run: |
+          set -euo pipefail
+          while IFS= read -r IMAGE; do
+            [[ -n "$IMAGE" ]] || continue
+            TARGETS=("$IMAGE:$TAG" "$IMAGE:latest")
+            SOURCES=(
+              "$IMAGE:$TAG-linux"
+              "$IMAGE:$TAG-windows-amd64"
+              "$IMAGE:$TAG-windows-arm64"
+            )
+            for TARGET in "${TARGETS[@]}"; do
+              docker buildx imagetools create -t "$TARGET" "${SOURCES[@]}"
+            done
+            docker buildx imagetools inspect "$IMAGE:$TAG" | tee manifest.txt
+            for PLATFORM in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+              grep -Eq "Platform:[[:space:]]+$PLATFORM([[:space:]]|$)" manifest.txt \
+                || { echo "::error::$IMAGE:$TAG is missing $PLATFORM"; exit 1; }
+            done
+          done < repositories.txt
