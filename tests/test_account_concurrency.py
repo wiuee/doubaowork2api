@@ -153,6 +153,20 @@ async def test_subsecond_cooldown_is_rounded_up(tmp_path):
     assert "about 1s" in str(error.value)
 
 
+def test_success_preserves_error_from_same_clock_tick(tmp_path, monkeypatch):
+    pool = AccountPool(tmp_path / "accounts")
+    account = Account(id="one", cookies={}, device_id="test", web_id="test")
+    pool._accounts = [account]
+    now = 1_700_000_000.0
+    monkeypatch.setattr("doubao_work2api.accounts.time.time", lambda: now)
+    pool.mark_cooldown(account, "same-tick failure", "429")
+    pool.mark_success(account, started_at=now)
+    assert account.error_code == "429"
+    assert account.last_error == "same-tick failure"
+    assert account.last_error_at == now
+    assert not account.available
+
+
 @pytest.mark.parametrize("disable", [False, True])
 async def test_concurrent_success_does_not_erase_later_failure(tmp_path, disable):
     service, transport, pool = make_service(tmp_path, 0)

@@ -359,7 +359,11 @@ class AccountPool:
     def mark_success(self, account: Account, *, started_at: float | None = None) -> None:
         # A concurrent request's later failure must survive this request's
         # success; otherwise a cooldown/verification warning could disappear.
-        if started_at is not None and (not account.enabled or account.last_error_at > started_at):
+        # Equal timestamps can still be a later error on coarse-resolution
+        # Windows clocks, so preserve the error conservatively in that case.
+        if started_at is not None and (
+            not account.enabled or account.last_error_at >= started_at
+        ):
             return
         if account.cooldown_until or account.last_error or account.error_code or account.last_error_at:
             candidate = replace(account)
