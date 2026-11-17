@@ -22,6 +22,7 @@ concurrency:
 env:
   TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
   CURL_CFFI_VERSION: "0.17.0"
+  CRYPTOGRAPHY_VERSION: "50.0.2"
   DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
   DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -102,6 +103,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          build-args: CRYPTOGRAPHY_VERSION=${{ env.CRYPTOGRAPHY_VERSION }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -114,7 +116,7 @@ jobs:
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}-linux"
           for ARCH in amd64 arm64; do
             docker run --rm --platform "linux/$ARCH" --entrypoint python "$IMAGE" \
-              -c "import platform, curl_cffi; assert curl_cffi.__version__ == '$CURL_CFFI_VERSION'; print(platform.machine(), curl_cffi.__version__)"
+              -c "import platform, cryptography, curl_cffi; assert cryptography.__version__ == '$CRYPTOGRAPHY_VERSION'; assert curl_cffi.__version__ == '$CURL_CFFI_VERSION'; print(platform.machine(), cryptography.__version__, curl_cffi.__version__)"
           done
       - name: Smoke test the Linux gateway and dashboard
         run: |
@@ -150,7 +152,7 @@ jobs:
     name: Windows ${{ matrix.arch }}
     needs: version
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -161,6 +163,8 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
             base: mcr.microsoft.com/windows/servercore:ltsc2025-arm64
+    env:
+      MATRIX_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -176,6 +180,44 @@ jobs:
         run: |
           docker version
           if ($LASTEXITCODE -ne 0) { throw "Docker engine is not ready" }
+      - name: Set up MSVC for Windows ARM64
+        if: matrix.arch == 'arm64'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: arm64
+      - name: Prepare cryptography wheel for Windows AMD64
+        if: matrix.arch == 'amd64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path .docker-wheels | Out-Null
+          python -m pip wheel --no-cache-dir --no-deps --only-binary=:all: --wheel-dir .docker-wheels "cryptography==$env:CRYPTOGRAPHY_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "cryptography wheel download failed" }
+      - name: Build cryptography wheel for Windows ARM64
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -c "import platform; assert platform.machine().upper() == 'ARM64'; print(platform.python_version(), platform.machine())"
+          if ($LASTEXITCODE -ne 0) { throw "native ARM64 Python is required" }
+          $triplet = 'arm64-windows-static-md'
+          vcpkg install --triplet $triplet --clean-after-build openssl
+          if ($LASTEXITCODE -ne 0) { throw "OpenSSL ARM64 build failed" }
+          $env:OPENSSL_DIR = "$env:VCPKG_INSTALLATION_ROOT\installed\$triplet"
+          New-Item -ItemType Directory -Force -Path .docker-wheels | Out-Null
+          python -m pip wheel --no-cache-dir --no-deps --wheel-dir .docker-wheels "cryptography==$env:CRYPTOGRAPHY_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "cryptography ARM64 wheel build failed" }
+      - name: Verify staged cryptography wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pattern = ".docker-wheels\cryptography-$env:CRYPTOGRAPHY_VERSION-*-win_${env:MATRIX_ARCH}.whl"
+          $wheels = @(Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue)
+          if ($wheels.Count -ne 1) { throw "Expected one staged cryptography wheel matching $pattern" }
+          $wheelPath = $wheels[0].FullName
+          python -m zipfile -t $wheelPath
+          if ($LASTEXITCODE -ne 0) { throw "staged wheel failed ZIP validation" }
+          Write-Host "Staged $wheelPath"
       - name: Log in to GHCR
         shell: pwsh
         env:
@@ -209,7 +251,8 @@ jobs:
           $arguments = @(
             'build', '--file', 'Dockerfile.windows',
             '--build-arg', "TARGETARCH=$env:MATRIX_ARCH",
-            '--build-arg', "WINDOWS_BASE=$env:WINDOWS_BASE"
+            '--build-arg', "WINDOWS_BASE=$env:WINDOWS_BASE",
+            '--build-arg', "CRYPTOGRAPHY_VERSION=$env:CRYPTOGRAPHY_VERSION"
           )
           foreach ($tag in $tags) { $arguments += @('--tag', $tag) }
           $arguments += '.'
@@ -226,7 +269,7 @@ jobs:
         env:
           EXPECTED_MACHINE: ${{ matrix.arch == 'amd64' && 'AMD64' || 'ARM64' }}
         run: |
-          docker run --rm $env:IMAGE C:\Python\python.exe -c "import platform, curl_cffi; assert curl_cffi.__version__ == '$env:CURL_CFFI_VERSION'; assert platform.machine().upper() == '$env:EXPECTED_MACHINE'; print(platform.machine(), curl_cffi.__version__)"
+          docker run --rm $env:IMAGE C:\Python\python.exe -c "import platform, cryptography, curl_cffi; assert cryptography.__version__ == '$env:CRYPTOGRAPHY_VERSION'; assert curl_cffi.__version__ == '$env:CURL_CFFI_VERSION'; assert platform.machine().upper() == '$env:EXPECTED_MACHINE'; print(platform.machine(), cryptography.__version__, curl_cffi.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Windows curl_cffi smoke test failed" }
       - name: Smoke test the Windows gateway and dashboard
         shell: pwsh

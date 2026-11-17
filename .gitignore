@@ -9,3 +9,4 @@ accounts/
 data/
 *.log
 *.egg-info/
+.docker-wheels/

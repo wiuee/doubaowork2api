@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+ARG CRYPTOGRAPHY_VERSION=50.0.2
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DOUBAO_WORK_HOST=0.0.0.0 \
@@ -10,8 +12,8 @@ COPY pyproject.toml README.md CHANGELOG.md ./
 COPY THIRD_PARTY_NOTICES.md ./
 COPY licenses ./licenses
 COPY doubao_work2api ./doubao_work2api
-RUN pip install --no-cache-dir . "curl-cffi==0.17.0" \
-    && python -c "import curl_cffi; print('curl_cffi', curl_cffi.__version__)"
+RUN pip install --no-cache-dir . "curl-cffi==0.17.0" "cryptography==${CRYPTOGRAPHY_VERSION}" \
+    && python -c "import cryptography, curl_cffi; print('cryptography', cryptography.__version__, 'curl_cffi', curl_cffi.__version__)"
 
 RUN useradd --create-home --uid 10001 app \
     && mkdir -p /app/accounts /app/data \
